@@ -13,6 +13,7 @@ import { queryKey, sleep } from '@tanstack/query-test-utils'
 import { QueryClient, createQuery, keepPreviousData } from '../../src/index.js'
 import { promiseWithResolvers, withEffectRoot } from '../utils.svelte.js'
 import Base from './Base.svelte'
+import ErrorBoundary from './ErrorBoundary.svelte'
 import Counter from './Counter.svelte'
 import IsRestoring from './IsRestoring.svelte'
 import Select from './Select.svelte'
@@ -1235,6 +1236,41 @@ describe('createQuery', () => {
   )
 
   it(
+    'should not widen tracked props for unrelated data-only consumers after an error occurs',
+    withEffectRoot(async () => {
+      const key = queryKey()
+      const dataOnlyRuns: Array<string | undefined> = []
+
+      const query = createQuery<string>(
+        () => ({
+          queryKey: key,
+          queryFn: () => Promise.reject(new Error('fail')),
+          retry: false,
+          // `false` never satisfies `shouldThrowError`, so the query settles
+          // into an error state without throwing — this is the case where
+          // the throw-effect's `!query.isFetching` check (guarded behind
+          // `query.isError`) reads `isFetching` and, unless read from the
+          // untracked result, would mark it tracked from then on.
+          throwOnError: false,
+        }),
+        () => queryClient,
+      )
+
+      // This effect only ever reads `data`. Once the query above has settled
+      // into an error state, `isFetching` transitions on a later refetch must
+      // not cause this unrelated, data-only effect to re-run.
+      $effect(() => {
+        dataOnlyRuns.push(query.data)
+      })
+
+      await vi.advanceTimersByTimeAsync(0)
+      await query.refetch()
+
+      expect(dataOnlyRuns).toHaveLength(1)
+    }),
+  )
+
+  it(
     'should always re-render if we are tracking props but not using any',
     withEffectRoot(async () => {
       const key = queryKey()
@@ -1579,6 +1615,102 @@ describe('createQuery', () => {
     expect(rendered.getByTestId('status')).toHaveTextContent('error')
     expect(rendered.getByTestId('error')).toHaveTextContent('Local Error')
   })
+
+  it('should throw error to the nearest svelte:boundary when throwOnError is true', async () => {
+    const key = queryKey()
+    const consoleMock = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined)
+
+    const rendered = render(ErrorBoundary, {
+      props: {
+        queryClient,
+        options: () => ({
+          queryKey: key,
+          queryFn: () => Promise.reject(new Error('Error test')),
+          retry: false,
+          throwOnError: true,
+        }),
+      },
+    })
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(rendered.getByTestId('error-boundary')).toHaveTextContent(
+      'Error test',
+    )
+
+    consoleMock.mockRestore()
+  })
+
+  it('should throw error to the nearest svelte:boundary when throwOnError function returns true', async () => {
+    const key = queryKey()
+    const consoleMock = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined)
+
+    const rendered = render(ErrorBoundary, {
+      props: {
+        queryClient,
+        options: () => ({
+          queryKey: key,
+          queryFn: () => Promise.reject(new Error('Local Error')),
+          retry: false,
+          throwOnError: (err: Error) => err.message === 'Local Error',
+        }),
+      },
+    })
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(rendered.getByTestId('error-boundary')).toHaveTextContent(
+      'Local Error',
+    )
+
+    consoleMock.mockRestore()
+  })
+
+  it('should throw error to the nearest svelte:boundary when queryFn rejects with a falsy error and throwOnError is in use', async () => {
+    const key = queryKey()
+    const consoleMock = vi
+      .spyOn(console, 'error')
+      .mockImplementation(() => undefined)
+
+    const rendered = render(ErrorBoundary, {
+      props: {
+        queryClient,
+        options: () => ({
+          queryKey: key,
+          queryFn: () => Promise.reject(),
+          retry: false,
+          throwOnError: true,
+        }),
+      },
+    })
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(rendered.getByTestId('error-boundary')).toBeInTheDocument()
+
+    consoleMock.mockRestore()
+  })
+
+  it(
+    'should update with data if we observe no properties and throwOnError',
+    withEffectRoot(async () => {
+      const key = queryKey()
+
+      const query = createQuery<string>(
+        () => ({
+          queryKey: key,
+          queryFn: () => Promise.resolve('data'),
+          throwOnError: true,
+        }),
+        () => queryClient,
+      )
+
+      await vi.advanceTimersByTimeAsync(0)
+      expect(queryClient.isFetching()).toBe(0)
+      expect(query.data).toBe('data')
+    }),
+  )
 
   it(
     'should support changing provided query client',
